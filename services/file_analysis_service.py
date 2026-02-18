@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from typing import List, Dict, Optional
 import json
+import httpx
 
 from models import FileMetadata, FolderOrganization, OrganizationResult
 from utils import (
@@ -12,59 +13,16 @@ from utils import (
     AnalysisError,
     FileAccessError,
 )
+from utils.interactive import prompt_for_classification, prompt_for_subcategory
 
 
 class FileAnalysisService:
     """Service for analyzing files and suggesting organization."""
 
-    # Category keywords mapping
-    CATEGORY_KEYWORDS = {
-        "Documents": [
-            "document", "doc", "pdf", "word", "text", "report", "essay",
-            "article", "paper", "memo", "letter", "contract", "agreement"
-        ],
-        "Images": [
-            "image", "photo", "picture", "img", "graphic", "design",
-            "icon", "screenshot", "jpeg", "jpg", "png", "bmp", "gif"
-        ],
-        "Videos": [
-            "video", "movie", "film", "clip", "recording", "mp4",
-            "avi", "mkv", "mov", "wmv", "flv"
-        ],
-        "Audio": [
-            "audio", "music", "sound", "song", "podcast", "mp3",
-            "wav", "flac", "aac", "ogg", "wma"
-        ],
-        "Code": [
-            "code", "script", "program", "source", "python", "java",
-            "javascript", "cpp", "csharp", "ruby", "php", "go", "rust",
-            "py", "js", "ts", "java", "cpp", "h", "hpp", "c"
-        ],
-        "Data": [
-            "data", "dataset", "database", "csv", "sql", "json",
-            "xml", "excel", "sheet", "table", "database", "backup"
-        ],
-        "Configuration": [
-            "config", "settings", "setup", "configuration", "ini",
-            "conf", "yaml", "yml", "env", "properties", "toml"
-        ],
-        "Archives": [
-            "archive", "compressed", "zip", "rar", "7z", "tar",
-            "gz", "bz2", "xz"
-        ],
-        "Backup": [
-            "backup", "restore", "recovery", "old", "previous",
-            "archive", "copy", "tmp", "temp", "bak"
-        ],
-        "README": [
-            "readme", "guide", "help", "tutorial", "documentation",
-            "getting started", "installation", "usage"
-        ],
-    }
-
     def __init__(self):
         """Initialize the analysis service."""
         self.analysis_cache: Dict[str, FileMetadata] = {}
+        self.llm_cache: Dict[str, tuple] = {}  # Cache LLM responses by file hash
 
     def analyze_folder(self, folder_path: str) -> OrganizationResult:
         """
@@ -145,7 +103,7 @@ class FileAnalysisService:
             )
 
             # Suggest improved name
-            suggested_name = self._suggest_filename(file_name, category)
+            suggested_name = self._suggest_filename(file_name, category, file_type, content_preview)
 
             tags = self._extract_tags(file_name, content_preview)
 
@@ -167,30 +125,206 @@ class FileAnalysisService:
     def _suggest_category(
         self, filename: str, file_type: str, content: str
     ) -> tuple[str, float]:
-        """Suggest category and confidence score."""
-        filename_lower = filename.lower()
-        content_lower = content.lower()
+        """Suggest category and confidence score using AI when available.
 
-        scores = {}
+        Delegates to external LLM or OpenAI for classification.
+        If no AI is configured, returns "Uncategorized" with 0.0 confidence.
+        """
+        ai_category, ai_conf = self._ai_suggest_category(filename, file_type, content)
+        return ai_category, ai_conf
 
-        # Check keywords in filename and content
-        for category, keywords in self.CATEGORY_KEYWORDS.items():
-            matches = sum(
-                1 for kw in keywords if kw in filename_lower or kw in content_lower
-            )
-            if matches > 0:
-                scores[category] = matches
+    def _ai_suggest_category(self, filename: str, file_type: str, content: str) -> tuple[str, float]:
+        """AI-based category classification using external LLM or OpenAI.
 
-        if scores:
-            best_category = max(scores, key=scores.get)
-            confidence = min(scores[best_category] / 3, 1.0)
-            return best_category, confidence
+        Returns (category, confidence). 
+        Falls back to interactive prompt only if INTERACTIVE_MODE=true.
+        Otherwise returns ("Uncategorized", 0.0).
+        """
+        # Try external LLM first
+        try:
+            external_url = os.environ.get("EXTERNAL_LLM_URL")
+            external_key = os.environ.get("EXTERNAL_LLM_API_KEY")
+            if external_url:
+                external_result = self._external_llm_classify(
+                    external_url, external_key, filename, file_type, content
+                )
+                if external_result:
+                    cat, conf, subcat, _ = external_result
+                    return (cat, conf)
 
+            # Try OpenAI if no external URL
+            openai_key = os.environ.get("OPENAI_API_KEY")
+            if openai_key:
+                openai_result = self._openai_classify(openai_key, filename, file_type, content)
+                if openai_result:
+                    cat, conf, subcat, _ = openai_result
+                    return (cat, conf)
+        except Exception:
+            pass
+
+        # Fallback to interactive prompt only if explicitly enabled
+        if os.environ.get("INTERACTIVE_MODE", "").lower() == "true":
+            try:
+                result = prompt_for_classification(filename, file_type, content)
+                if result:
+                    cat, conf, subcat, _ = result
+                    return (cat, conf)
+            except Exception:
+                pass
+
+        # No AI and not in interactive mode: return uncategorized
         return "Uncategorized", 0.0
 
-    def _suggest_filename(self, original_name: str, category: str) -> str:
-        """Suggest an improved filename."""
-        # For now, return the original if it's good, or enhance it
+    def _external_llm_classify(
+        self, url: str, api_key: Optional[str], filename: str, file_type: str, content: str
+    ) -> Optional[tuple[str, float, Optional[str], Optional[str]]]:
+        """Call an external LLM endpoint to classify and name the file.
+
+        Expected to receive a JSON response with keys: `category`, `confidence`,
+        optional `subcategory`, optional `suggested_name`.
+        This function is optional and will be skipped when `EXTERNAL_LLM_URL` is not set.
+        """
+        # Build a compact prompt payload asking for JSON output
+        payload = {
+            "input": {
+                "filename": filename,
+                "file_type": file_type,
+                "content_preview": (content or "")[:1000],
+            },
+            "instructions": (
+                "Classify the file into a category and optional subcategory, and "
+                "suggest a concise suggested_name. Respond with a JSON object: {\"category\":..., \"confidence\":..., "
+                "\"subcategory\":..., \"suggested_name\":...}"
+            ),
+        }
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                r = client.post(url, json=payload, headers=headers)
+                r.raise_for_status()
+                # Expect JSON in response body
+                data = r.json()
+
+                # Accept either top-level or under `result` key
+                if "result" in data and isinstance(data["result"], dict):
+                    data = data["result"]
+
+                category = data.get("category") or data.get("label")
+                confidence = float(data.get("confidence", 0.0)) if data.get("confidence") is not None else 0.0
+                subcategory = data.get("subcategory")
+                suggested_name = data.get("suggested_name")
+
+                if category:
+                    return category, confidence, subcategory, suggested_name
+
+        except Exception:
+            return None
+
+        return None
+
+    def _openai_classify(self, api_key: str, filename: str, file_type: str, content: str) -> Optional[tuple[str, float, Optional[str], Optional[str]]]:
+        """Classify using OpenAI Chat Completions API.
+
+        Returns (category, confidence, subcategory, suggested_name) or None on failure.
+        """
+        try:
+            prompt = (
+                "You are a file classifier. Given filename, file_type and a short content_preview, "
+                "return a JSON object with keys: category(str), confidence(float 0-1), optional subcategory(str), "
+                "optional suggested_name(str). Only output valid JSON. Example: {\"category\": \"Code\", \"confidence\": 0.9, \"subcategory\": \"Python\"}.\n\n"
+            )
+
+            payload = {
+                "model": "gpt-3.5-turbo",
+                "messages": [
+                    {"role": "system", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "filename": filename,
+                                "file_type": file_type,
+                                "content_preview": (content or "")[:1000],
+                            }
+                        ),
+                    },
+                ],
+                "temperature": 0.0,
+                "max_tokens": 300,
+            }
+
+            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+
+            with httpx.Client(timeout=15.0) as client:
+                r = client.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+
+                choices = data.get("choices") or []
+                if not choices:
+                    return None
+                content_text = choices[0].get("message", {}).get("content", "")
+
+                json_text = self._extract_json_from_text(content_text)
+                if not json_text:
+                    return None
+
+                parsed = json.loads(json_text)
+                category = parsed.get("category") or parsed.get("label")
+                confidence = float(parsed.get("confidence", 0.0)) if parsed.get("confidence") is not None else 0.0
+                subcategory = parsed.get("subcategory")
+                suggested_name = parsed.get("suggested_name")
+                if category:
+                    return category, confidence, subcategory, suggested_name
+        except Exception:
+            return None
+
+        return None
+
+    def _extract_json_from_text(self, text: str) -> Optional[str]:
+        """Find a JSON object substring in free text and return it, or None."""
+        try:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                candidate = text[start : end + 1]
+                json.loads(candidate)
+                return candidate
+        except Exception:
+            return None
+        return None
+
+    def _suggest_filename(self, original_name: str, category: str, file_type: str, content_preview: str) -> str:
+        """Suggest an improved filename using AI if available, otherwise heuristics.
+
+        Tries external LLM/OpenAI first to get AI-suggested names.
+        Falls back to heuristic-based suggestion if no AI is configured.
+        """
+        try:
+            # Try external LLM first
+            external_url = os.environ.get("EXTERNAL_LLM_URL")
+            external_key = os.environ.get("EXTERNAL_LLM_API_KEY")
+            if external_url:
+                result = self._external_llm_classify(
+                    external_url, external_key, original_name, file_type, content_preview
+                )
+                if result and result[3]:  # result[3] is suggested_name
+                    return result[3]
+
+            # Try OpenAI
+            openai_key = os.environ.get("OPENAI_API_KEY")
+            if openai_key:
+                result = self._openai_classify(openai_key, original_name, file_type, content_preview)
+                if result and result[3]:  # result[3] is suggested_name
+                    return result[3]
+        except Exception:
+            pass
+
+        # Fallback to heuristic-based naming
         name_without_ext = Path(original_name).stem
         ext = Path(original_name).suffix
 
@@ -256,23 +390,49 @@ class FileAnalysisService:
         )
 
     def _detect_subcategory(self, file_metadata: FileMetadata) -> Optional[str]:
-        """Detect a more specific subcategory for code files.
+        """Detect a more specific subcategory for files.
 
-        Returns one of 'Python', 'SQL', 'Java' when detected, otherwise None.
+        Tries external LLM/OpenAI first, then interactive prompt if INTERACTIVE_MODE=true.
+        Returns None if AI unavailable and not in interactive mode.
         """
-        # Use file extension first
         ext = (file_metadata.file_type or "").lower()
         name = file_metadata.original_name.lower()
         content = (file_metadata.content_preview or "").lower()
 
-        if ext in [".py", ".pyw"] or "python" in name or "python" in content:
-            return "Python"
-        if ext in [".sql"] or "sql" in name or "sql" in content:
-            return "SQL"
-        if ext in [".java"] or "java" in name or "java" in content:
-            return "Java"
+        # If external LLM or OpenAI is configured, ask it for subcategory
+        try:
+            external_url = os.environ.get("EXTERNAL_LLM_URL")
+            external_key = os.environ.get("EXTERNAL_LLM_API_KEY")
+            if external_url:
+                result = self._external_llm_classify(
+                    external_url, external_key, file_metadata.original_name, ext, content
+                )
+                if result:
+                    cat, conf, subcat, _ = result
+                    if subcat:
+                        return subcat
 
-        # Fallback: no specific subcategory detected
+            openai_key = os.environ.get("OPENAI_API_KEY")
+            if openai_key:
+                result = self._openai_classify(openai_key, file_metadata.original_name, ext, content)
+                if result:
+                    cat, conf, subcat, _ = result
+                    if subcat:
+                        return subcat
+        except Exception:
+            pass
+
+        # Fallback to interactive prompt only if explicitly enabled
+        if os.environ.get("INTERACTIVE_MODE", "").lower() == "true":
+            try:
+                category = file_metadata.suggested_category
+                subcategory = prompt_for_subcategory(category)
+                if subcategory:
+                    return subcategory
+            except Exception:
+                pass
+
+        # No AI and not in interactive mode: return None
         return None
 
     def _build_structure(self, organized_folders: List[FolderOrganization]) -> dict:

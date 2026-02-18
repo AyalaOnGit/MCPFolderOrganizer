@@ -1,16 +1,18 @@
 # File Organizer
 
-A small Python utility to analyze a folder and suggest an organized folder structure based on file types and simple content/filename heuristics.
+A Python utility to analyze folders and suggest organized file structures using AI classification. The classifier can use OpenAI, a custom LLM endpoint, or interactive prompts.
 
 ## Features
 
-- Analyze a folder and suggest categories for files (Documents, Images, Code, Data, Configuration, etc.).
-- Subcategorize code files into `Code/Python`, `Code/SQL`, and `Code/Java` when detected.
-- Produce a suggested folder structure and file renaming hints.
+- Analyze a folder and suggest categories for files using AI.
+- Subcategorize files with AI-determined categories (e.g., Python, Flask, PostgreSQL, etc.).
+- Produce a suggested folder structure and AI-suggested filenames.
+- Support for OpenAI, custom LLM endpoints, or interactive manual classification.
+- Graceful fallback: when AI unavailable, optionally ask user for input via CLI/Inspector.
 
 ## Quick start
 
-Prerequisites: Python 3.9+ and pip. Node.js is optional if you use the MCP Inspector.
+Prerequisites: Python 3.9+ and pip.
 
 Install dependencies:
 
@@ -24,14 +26,65 @@ Run tests:
 python -m pytest -q
 ```
 
-Run the main script (example):
+## Using the classifier
+
+### Option 1: OpenAI (recommended)
+
+1. Get an OpenAI API key from [platform.openai.com](https://platform.openai.com).
+2. Run with AI:
 
 ```powershell
-python main.py /path/to/your/folder
+$env:OPENAI_API_KEY = 'sk-your-key-here'
+python main.py /path/to/folder
 ```
 
-Notes about MCP Inspector (optional):
-- The project is independent of the MCP Inspector. If you use the Inspector, ensure its proxy is running on `localhost:6277` before connecting.
+### Option 2: Custom LLM endpoint
+
+If you have a custom LLM service, configure it:
+
+```powershell
+$env:EXTERNAL_LLM_URL = 'https://your-llm-api.example.com/classify'
+$env:EXTERNAL_LLM_API_KEY = 'your-api-key'
+python main.py /path/to/folder
+```
+
+Your endpoint should accept JSON:
+```json
+{
+  "filename": "example.py",
+  "file_type": ".py",
+  "content_preview": "def hello(): ..."
+}
+```
+
+And return JSON:
+```json
+{
+  "category": "Code",
+  "confidence": 0.95,
+  "subcategory": "Python",
+  "suggested_name": "hello_world.py"
+}
+```
+
+### Option 3: Interactive mode (manual classification)
+
+For testing or when you prefer to classify files manually:
+
+```powershell
+$env:INTERACTIVE_MODE = 'true'
+python main.py /path/to/folder
+```
+
+The system will prompt you for each file's category, confidence, subcategory, and suggested name.
+
+### Option 4: No AI (auto-categorizes as "Uncategorized")
+
+```powershell
+python main.py /path/to/folder
+```
+
+All files will be categorized as "Uncategorized" without any AI or interactive prompts.
 
 ## Project layout
 
